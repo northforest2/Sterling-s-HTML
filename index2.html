@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Gamepad -> PWM Controller</title>
+    <style>
+        body {
+            font-family: system-ui, Arial;
+            margin: 20px;
+        }
+
+        .status {
+            margin-bottom: 10px;
+        }
+
+        .pad {
+            margin-top: 10px;
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .box {
+            border: 1px solid #ccc;
+            padding: 10px;
+            min-width: 220px;
+            border-radius: 6px;
+        }
+
+        .led {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .green {
+            background: #2ecc71;
+        }
+
+        .red {
+            background: #e74c3c;
+        }
+
+        .gray {
+            background: #ccc;
+        }
+
+        pre {
+            margin: 0;
+            font-size: 13px;
+            background: #f7f7f7;
+            padding: 8px;
+            border-radius: 4px;
+        }
+
+        button {
+            padding: 6px 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Gamepad -> PWM Controller</h1>
+    <div class="status">
+        <span class="led gray" id="connLed"></span>
+        <strong id="gpName">No gamepad</strong>
+        <span id="info"></span>
+    </div>
+
+    <div class="pad">
+        <div class="box">
+            <div><strong>Mapping</strong></div>
+            <ul>
+                <li>Left stick Y: Motor A (forward/backwards)</li>
+                <li>Right stick Y: Motor B</li>
+                <li>Button A: Toggle motors ON/OFF</li>
+                <li>Button B: Brake (sets PWM=0)</li>
+                <li>Button X: Set max speed</li>
+            </ul>
+            <div style="margin-top:8px">
+                <button id="btnEnable">Enable motors</button>
+                <button id="btnDisable">Disable motors</button>
+            </div>
+        </div>
+
+        <div class="box">
+            <div><strong>Realtime</strong></div>
+            <div>Motor A PWM: <span id="mA">0</span></div>
+            <div>Motor B PWM: <span id="mB">0</span></div>
+            <div style="margin-top:8px">Raw axes:
+                <pre id="axes">-</pre>
+            </div>
+            <div style="margin-top:8px">Buttons:
+                <pre id="buttons">-</pre>
+            </div>
+        </div>
+
+        <div class="box">
+            <div><strong>Backend</strong></div>
+            <label>API URL: <input id="apiUrl" value="http://192.168.4.1" style="width:200px"></label>
+            <div style="margin-top:8px; font-size:13px; color:#555">
+                Expects POST /motor with JSON { motor: "A"|"B", pwm: 0-255 } or POST /control { cmd:
+                "enable"|"disable"|"brake" }
+                <div style="margin-top:6px;color:#999">(Implement this on your microcontroller / server; CORS must allow
+                    the page.)</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        "use strict";
+
+        // GitHub Copilot
+        // Simple Gamepad -> PWM bridge.
+        // Adjust constants below to match your hardware / API.
+
+        const API_DEFAULT = document.getElementById('apiUrl').value;
+        let API_URL = API_DEFAULT;
+
+        const pollIntervalMs = 50;         // throttle send rate
+        const deadzone = 0.05;             // axes smaller than this treated as 0
+        const maxPWM = 255;                // scale to 0..255
+        const invertLeftY = true;          // many controllers Y is negative up; flip if needed
+
+        let enabled = false;
+        let lastSent = { A: 0, B: 0, ctrl: 0 };
+        let lastValue = { A: 0, B: 0 };
+
+        const connLed = document.getElementById('connLed');
+        const gpName = document.getElementById('gpName');
+        const info = document.getElementById('info');
+        const mA = document.getElementById('mA');
+        const mB = document.getElementById('mB');
+        const axesDiv = document.getElementById('axes');
+        const buttonsDiv = document.getElementById('buttons');
+
+        document.getElementById('apiUrl').addEventListener('change', (e) => { API_URL = e.target.value; });
+        document.getElementById('btnEnable').addEventListener('click', () => { sendControl('enable'); enabled = true; });
+        document.getElementById('btnDisable').addEventListener('click', () => { sendControl('disable'); enabled = false; });
+
+        window.addEventListener("gamepadconnected", (e) => {
+            gpName.textContent = `${e.gamepad.id} (index ${e.gamepad.index})`;
+            connLed.className = 'led green';
+        });
+
+        window.addEventListener("gamepaddisconnected", (e) => {
+            gpName.textContent = "No gamepad";
+            connLed.className = 'led gray';
+        });
+
+        // Map buttons by standard layout:
+        // 0: A, 1: B, 2: X, 3: Y, 4:L1,5:R1,6:L2,7:R2,8:Back,9:Start,10:LS,11:RS,12:DUp,13:DDown,14:DLeft,15:DRight
+        function readGamepad() {
+            const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+            if (!gps) return null;
+            for (let i = 0; i < gps.length; i++) {
+                if (gps[i]) return gps[i];
+            }
+            return null;
+        }
+
+        function axisToPWM(v, invert = false) {
+            if (Math.abs(v) < deadzone) return 0;
+            let val = invert ? -v : v;
+            // assume pushing stick up gives -1 on many controllers => we map forward to positive PWM
+            // clamp [-1..1] then scale to 0..maxPWM using absolute value (direction can be implied by sign if needed)
+            val = Math.max(-1, Math.min(1, val));
+            return Math.round(Math.abs(val) * maxPWM);
+        }
+
+        async function sendPWM(motor, pwm) {
+            const now = Date.now();
+            if (now - lastSent[motor] < pollIntervalMs) return; // throttle
+            lastSent[motor] = now;
+            lastValue[motor] = pwm;
+            // POST to /motor
+            try {
+                await fetch(`${API_URL}/motor`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ motor, pwm })
+                });
+                // ignore response payload
+            } catch (err) {
+                console.warn('sendPWM error', err);
+            }
+        }
+
+        async function sendControl(cmd) {
+            const now = Date.now();
+            if (now - lastSent.ctrl < 200) return;
+            lastSent.ctrl = now;
+            try {
+                await fetch(`${API_URL}/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cmd })
+                });
+            } catch (err) {
+                console.warn('sendControl error', err);
+            }
+        }
+
+        // Main loop
+        let lastPoll = 0;
+        function frameLoop() {
+            const now = performance.now();
+            if (now - lastPoll >= 16) { // ~60fps read
+                lastPoll = now;
+                const gp = readGamepad();
+                if (gp) {
+                    connLed.className = 'led green';
+                    gpName.textContent = `${gp.id} (idx ${gp.index})`;
+                    axesDiv.textContent = gp.axes.map(a => a.toFixed(3)).join(', ');
+                    buttonsDiv.textContent = gp.buttons.map((b, i) => `${i}:${b.pressed ? 1 : 0}`).join(' ');
+                    // axes: 0:left stick X, 1:left stick Y, 2:right stick X, 3:right stick Y (standard)
+                    const leftY = gp.axes[1] ?? 0;
+                    const rightY = gp.axes[3] ?? gp.axes[2] ?? 0; // fallback
+                    let pwmA = axisToPWM(leftY, invertLeftY);
+                    let pwmB = axisToPWM(rightY, invertLeftY);
+
+                    // Buttons handling
+                    const btnA = gp.buttons[0]?.pressed;
+                    const btnB = gp.buttons[1]?.pressed;
+                    const btnX = gp.buttons[2]?.pressed;
+                    const start = gp.buttons[9]?.pressed;
+
+                    // Toggle enable on A press (edge-detect)
+                    if (btnA && !frameLoop._prevA) {
+                        enabled = !enabled;
+                        sendControl(enabled ? 'enable' : 'disable');
+                    }
+                    // Brake on B (while held)
+                    if (btnB) {
+                        pwmA = 0;
+                        pwmB = 0;
+                        sendControl('brake');
+                    }
+                    // Max speed on X (while held)
+                    if (btnX) {
+                        pwmA = maxPWM;
+                        pwmB = maxPWM;
+                    }
+                    // Start button disables motors (example)
+                    if (start && !frameLoop._prevStart) {
+                        enabled = false;
+                        sendControl('disable');
+                    }
+
+                    frameLoop._prevA = !!btnA;
+                    frameLoop._prevStart = !!start;
+
+                    // If disabled, force 0
+                    if (!enabled) {
+                        pwmA = 0;
+                        pwmB = 0;
+                    }
+
+                    // Display
+                    mA.textContent = pwmA;
+                    mB.textContent = pwmB;
+
+                    // Send updates (throttled inside sendPWM)
+                    if (pwmA !== lastValue.A) sendPWM('A', pwmA);
+                    if (pwmB !== lastValue.B) sendPWM('B', pwmB);
+                } else {
+                    connLed.className = 'led gray';
+                    gpName.textContent = 'No gamepad';
+                }
+            }
+            requestAnimationFrame(frameLoop);
+        }
+        requestAnimationFrame(frameLoop);
+    </script>
+</body>
+
+</html>
